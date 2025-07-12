@@ -1,0 +1,177 @@
+from flask import Flask, request, jsonify
+import requests
+import os
+import tempfile
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+import logging
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Beatstars credentials from environment variables
+BEATSTARS_USERNAME = os.getenv('BEATSTARS_USERNAME')
+BEATSTARS_PASSWORD = os.getenv('BEATSTARS_PASSWORD')
+
+def setup_chrome_driver():
+    """Setup Chrome driver for Render deployment"""
+    chrome_options = Options()
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920,1080')
+    
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
+
+def download_audio_file(audio_url, filename):
+    """Download audio file from URL"""
+    try:
+        response = requests.get(audio_url, stream=True)
+        response.raise_for_status()
+        
+        with open(filename, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error downloading audio: {str(e)}")
+        return False
+
+def upload_to_beatstars(audio_file, title, tags, bpm=None, key=None):
+    """Upload beat to Beatstars"""
+    driver = setup_chrome_driver()
+    
+    try:
+        # Login to Beatstars
+        driver.get('https://www.beatstars.com/login')
+        
+        # Wait for login form
+        username_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "username"))
+        )
+        password_field = driver.find_element(By.NAME, "password")
+        
+        username_field.send_keys(BEATSTARS_USERNAME)
+        password_field.send_keys(BEATSTARS_PASSWORD)
+        
+        # Submit login
+        login_button = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        login_button.click()
+        
+        # Wait for dashboard
+        WebDriverWait(driver, 10).until(
+            EC.url_contains("dashboard")
+        )
+        
+        # Navigate to upload page
+        driver.get('https://www.beatstars.com/upload')
+        
+        # Wait for upload form
+        file_input = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.INPUT, "file"))
+        )
+        
+        # Upload file
+        file_input.send_keys(audio_file)
+        
+        # Fill in title
+        title_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "title"))
+        )
+        title_field.clear()
+        title_field.send_keys(title)
+        
+        # Fill in tags (if available)
+        if tags:
+            tags_field = driver.find_element(By.NAME, "tags")
+            tags_field.clear()
+            tags_field.send_keys(tags)
+        
+        # Fill in BPM (if available)
+        if bpm:
+            bpm_field = driver.find_element(By.NAME, "bpm")
+            bpm_field.clear()
+            bpm_field.send_keys(str(bpm))
+        
+        # Fill in key (if available)
+        if key:
+            key_field = driver.find_element(By.NAME, "key")
+            key_field.clear()
+            key_field.send_keys(key)
+        
+        # Submit upload
+        upload_button = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        upload_button.click()
+        
+        # Wait for success or check for upload completion
+        time.sleep(5)
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error uploading to Beatstars: {str(e)}")
+        return False
+    
+    finally:
+        driver.quit()
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy"})
+
+@app.route('/upload-beat', methods=['POST'])
+def upload_beat():
+    """Main endpoint to handle beat upload"""
+    try:
+        data = request.json
+        
+        # Validate required fields
+        if not data or 'audio_url' not in data or 'title' not in data:
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        audio_url = data['audio_url']
+        title = data['title']
+        tags = data.get('tags', '')
+        song_id = data.get('id', '')
+        
+        logging.info(f"Processing upload for: {title}")
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+            temp_filename = tmp_file.name
+        
+        try:
+            # Download audio file
+            if not download_audio_file(audio_url, temp_filename):
+                return jsonify({"error": "Failed to download audio file"}), 500
+            
+            # Upload to Beatstars
+            if upload_to_beatstars(temp_filename, title, tags):
+                return jsonify({
+                    "status": "success",
+                    "message": f"Successfully uploaded '{title}' to Beatstars",
+                    "song_id": song_id
+                })
+            else:
+                return jsonify({"error": "Failed to upload to Beatstars"}), 500
+                
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+    
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
